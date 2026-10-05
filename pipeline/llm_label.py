@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 
 import duckdb
 
@@ -60,14 +61,14 @@ def estimate_tokens(texts: list[str]) -> int:
 
 
 def parse_label(raw: str) -> str | None:
-    """Pull {"label": ...} out of the model's answer; None if it is not valid."""
-    m = re.search(r"\{.*\}", raw, flags=re.S)
-    if not m:
-        return None
+    """Accept only the requested JSON object and its allowed label."""
     try:
-        label = json.loads(m.group(0)).get("label")
-    except json.JSONDecodeError:
+        answer = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
         return None
+    if not isinstance(answer, dict) or set(answer) != {"label"}:
+        return None
+    label = answer["label"]
     return label if label in ALLOWED_LABELS else None
 
 
@@ -81,13 +82,38 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
 
 
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
+    """Cache by input, model and prompt version; quarantine invalid answers."""
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR,
+        label VARCHAR, PRIMARY KEY (input_hash, model, prompt_version))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_quarantine (
+        ticket_id VARCHAR, input_hash VARCHAR, model VARCHAR,
+        prompt_version VARCHAR, reason VARCHAR,
+        PRIMARY KEY (ticket_id, input_hash, model, prompt_version))""")
+    rows: list[tuple[str, str, str, str]] = []
+    new_calls = 0
     for ticket_id, text in live_tickets(con):
-        raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        input_hash = sha256(text.encode("utf-8")).hexdigest()
+        cached = con.execute("""SELECT label FROM llm_label_cache
+            WHERE input_hash = ? AND model = ? AND prompt_version = ?""",
+            [input_hash, llm.model, PROMPT_VERSION]).fetchone()
+        if cached is None:
+            raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
+            new_calls += 1
+            label = parse_label(raw)
+            con.execute("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?)",
+                        [input_hash, llm.model, PROMPT_VERSION, label])
+        else:
+            label = cached[0]
+        if label is None:
+            con.execute("""INSERT INTO llm_label_quarantine
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING""",
+                [ticket_id, input_hash, llm.model, PROMPT_VERSION,
+                 "LLM response is not a valid label JSON object"])
+        else:
+            rows.append((ticket_id, label, llm.model, PROMPT_VERSION))
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
         ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
     if rows:
         con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+    return {"labeled": len(rows), "calls": new_calls}
